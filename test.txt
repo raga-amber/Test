@@ -1,0 +1,93 @@
+#!/bin/bash
+
+# Directories
+FILES_DIR="/path/to/your/files"
+SUCCESS_DIR="/path/to/success"
+FAILURE_DIR="/path/to/failure"
+LOG_FILE="api_logs.csv"
+
+# Ensure success and failure directories exist
+mkdir -p "$SUCCESS_DIR"
+mkdir -p "$FAILURE_DIR"
+
+# Create or clear the log file
+echo "file_name,request_type,response_code,response_body" > $LOG_FILE
+
+generate_token() {
+  TOKEN_RESPONSE=$(curl -s -X POST "https://example.com/api/token" -H "Content-Type: application/json" -d '{
+    "username": "your_username",
+    "password": "your_password"
+  }')
+
+  # Extract the token from the response (assuming the token is in a field called 'token')
+  TOKEN=$(echo $TOKEN_RESPONSE | jq -r '.token')
+
+  # Check if the token is generated
+  if [ -z "$TOKEN" ]; then
+    echo "Failed to retrieve token"
+    exit 1
+  fi
+
+  echo "Token generated: $TOKEN"
+}
+
+# Generate the initial token
+generate_token
+
+# Process each .txt file in the directory
+for FILE_PATH in "$FILES_DIR"/*.txt; do
+  if [ -f "$FILE_PATH" ]; then
+    FILE_NAME=$(basename "$FILE_PATH")
+
+    # Second GET API request to create a bulk URI using the token, including file name as a query parameter
+    BULK_URI_RESPONSE=$(curl -s -X GET "https://example.com/api/bulk_uri?file_name=$FILE_NAME" -H "Authorization: Bearer $TOKEN")
+    BULK_URI_RESPONSE_CODE=$(echo $BULK_URI_RESPONSE | jq -r '.code')
+
+    # Check if the token is expired or invalid and re-generate it
+    if [ "$BULK_URI_RESPONSE_CODE" -eq 401 ] || [ "$BULK_URI_RESPONSE_CODE" -eq 403 ]; then
+      echo "Token expired or invalid, regenerating token..."
+      generate_token
+
+      # Retry creating the bulk URI
+      BULK_URI_RESPONSE=$(curl -s -X GET "https://example.com/api/bulk_uri?file_name=$FILE_NAME" -H "Authorization: Bearer $TOKEN")
+      BULK_URI_RESPONSE_CODE=$(echo $BULK_URI_RESPONSE | jq -r '.code')
+    fi
+
+    # Log the GET response
+    echo "$FILE_NAME,GET,$BULK_URI_RESPONSE_CODE,$BULK_URI_RESPONSE" >> $LOG_FILE
+
+    # Extract the bulk URI from the response (assuming the URI is in a field called 'bulk_uri')
+    BULK_URI=$(echo $BULK_URI_RESPONSE | jq -r '.bulk_uri')
+
+    # Check if the bulk URI is generated
+    if [ -z "$BULK_URI" ]; then
+      echo "Failed to retrieve bulk URI for $FILE_PATH"
+      mv "$FILE_PATH" "$FAILURE_DIR/"
+      continue
+    fi
+
+    echo "Bulk URI created for $FILE_PATH: $BULK_URI"
+
+    # Third PUT API call to send the .txt file in the body
+    PUT_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "$BULK_URI" -H "Authorization: Bearer $TOKEN" -H "Content-Type: text/plain" --data-binary @"$FILE_PATH")
+
+    # Log the PUT response
+    echo "$FILE_NAME,PUT,$PUT_RESPONSE," >> $LOG_FILE
+
+    # Move file based on response code
+    if [ "$PUT_RESPONSE" -eq 200 ]; then
+      mv "$FILE_PATH" "$SUCCESS_DIR/"
+      echo "File moved to success directory: $FILE_PATH"
+    else
+      mv "$FILE_PATH" "$FAILURE_DIR/"
+      echo "File moved to failure directory: $FILE_PATH"
+    fi
+
+    echo "PUT request response for $FILE_PATH: $PUT_RESPONSE"
+  else
+    echo "No .txt files found in the directory"
+  fi
+done
+
+# Run Python script to convert CSV to Excel
+python3 convert_logs_to_excel.py $LOG_FILE
